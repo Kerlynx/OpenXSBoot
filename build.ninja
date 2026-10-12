@@ -1,0 +1,16 @@
+# OpenXSBoot 专用：只构建 UEFI 引导
+ninja_required_version = 1.10
+cc = x86_64-w64-mingw32-gcc
+boot_c_flags = -fdiagnostics-color=always -g -I ./boot/include -Wextra -e efi_main -nostdinc -nostdlib -fno-builtin -Wl,--subsystem,10 -fshort-wchar
+
+rule boot
+  command = mkdir -p $$(dirname $out) && $cc $boot_c_flags -o $out $in
+
+build out/BOOTX64.efi: boot boot/bootx64.c boot/bootlib.c | boot/include/acpi.h boot/include/boot.h boot/include/bootlib.h boot/include/efi.h boot/include/elf.h boot/include/fbc.h boot/include/memory.h boot/include/msr.h
+
+build all: phony out/BOOTX64.efi
+default all
+
+rule clean
+  command = rm -rf out
+build clean: clean
