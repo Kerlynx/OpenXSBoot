@@ -34,8 +34,24 @@ def main():
     edge = "build out/BOOTX64.efi: boot boot/bootx64.c boot/bootlib.c"
     if hstr:
         edge += f" | {hstr}"
-    L += [edge, "", "build all: phony out/BOOTX64.efi", "default all", "",
-          "rule clean", "  command = rm -rf out", "build clean: clean"]
+    L += [edge, ""]
+
+    # ---- xbps 打包（pack）----
+    pkg = {"name": "OpenXSBoot", "ver": "2.1_1", "arch": "x86_64",
+           "desc": "Leopard UEFI bootloader", "install": "EFI/BOOT/BOOTX64.EFI"}
+    pkg_args = f"-A {pkg['arch']} -n {pkg['name']}-{pkg['ver']} -s '{pkg['desc']}'"
+    xbps_out = f"out/{pkg['name']}-{pkg['ver']}.{pkg['arch']}.xbps"
+    L += [
+        "rule package",
+        f"  command = rm -rf .pkg && mkdir -p .pkg/$$(dirname {pkg['install']}) && "
+        f"cp out/BOOTX64.efi .pkg/{pkg['install']} && cd out && xbps-create {pkg_args} ../.pkg",
+        "",
+        f"build {xbps_out}: package out/BOOTX64.efi",
+        "build build: phony out/BOOTX64.efi",
+        f"build pack: phony {xbps_out}",
+        "default build", "",
+        "rule clean", "  command = rm -rf out .pkg", "build clean: clean",
+    ]
 
     (ROOT / "build.ninja").write_text("\n".join(L) + "\n", encoding="utf-8")
     print("已生成 build.ninja（仅引导）。构建：ninja")
