@@ -44,7 +44,7 @@ def main():
     L += [
         "rule package",
         f"  command = rm -rf .pkg && mkdir -p .pkg/$$(dirname {pkg['install']}) && "
-        f"cp out/BOOTX64.efi .pkg/{pkg['install']} && cd out && xbps-create {pkg_args} ../.pkg",
+        f"cp out/BOOTX64.efi .pkg/{pkg['install']} && cd out && xbps-create --compression gzip {pkg_args} ../.pkg",
         "",
         f"build {xbps_out}: package out/BOOTX64.efi",
         "build build: phony out/BOOTX64.efi",
