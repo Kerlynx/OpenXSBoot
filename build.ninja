@@ -6,11 +6,18 @@ boot_c_flags = -fdiagnostics-color=always -g -I ./boot/include -Wextra -e efi_ma
 rule boot
   command = mkdir -p $$(dirname $out) && $cc $boot_c_flags -o $out $in
 
-build out/BOOTX64.efi: boot boot/bootx64.c boot/bootlib.c | boot/include/acpi.h boot/include/boot.h boot/include/bootlib.h boot/include/efi.h boot/include/elf.h boot/include/fbc.h boot/include/memory.h boot/include/msr.h
+build out/BOOTX64.efi: boot boot/bootx64.c boot/bootlib.c | boot\include\acpi.h boot\include\boot.h boot\include\bootlib.h boot\include\efi.h boot\include\elf.h boot\include\fbc.h boot\include\memory.h boot\include\msr.h
 
 build all: phony out/BOOTX64.efi
 default all
 
+rule package
+  command = rm -rf .pkg && mkdir -p .pkg/EFI/BOOT && cp out/BOOTX64.efi .pkg/EFI/BOOT/BOOTX64.EFI && cd out && xbps-create --compression gzip -A x86_64 -n OpenXSBoot-2.1.0_1 -s 'Leopard UEFI bootloader' ../.pkg
+
+build out/OpenXSBoot-2.1.0_1.x86_64.xbps: package out/BOOTX64.efi
+
+build pack: phony out/OpenXSBoot-2.1.0_1.x86_64.xbps
+
 rule clean
-  command = rm -rf out
+  command = rm -rf out .pkg
 build clean: clean
