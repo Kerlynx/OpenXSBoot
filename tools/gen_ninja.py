@@ -34,8 +34,18 @@ def main():
     edge = "build out/BOOTX64.efi: boot boot/bootx64.c boot/bootlib.c"
     if hstr:
         edge += f" | {hstr}"
-    L += [edge, "", "build all: phony out/BOOTX64.efi", "default all", "",
-          "rule clean", "  command = rm -rf out", "build clean: clean"]
+    L += [edge, "", "build all: phony out/BOOTX64.efi", "default all", ""]
+
+    # xbps 打包：引导器装到 EFI/BOOT/BOOTX64.EFI（gzip 压缩，zstd 会踩内核懒分配 bug）
+    boot_pkg = "OpenXSBoot-2.1.0_1"
+    pkg_cmd = ("rm -rf .pkg && mkdir -p .pkg/EFI/BOOT && cp out/BOOTX64.efi .pkg/EFI/BOOT/BOOTX64.EFI && "
+               "cd out && xbps-create --compression gzip -A x86_64 "
+               f"-n {boot_pkg} -s 'Leopard UEFI bootloader' ../.pkg")
+    L += ["rule package", f"  command = {pkg_cmd}", "",
+          f"build out/{boot_pkg}.x86_64.xbps: package out/BOOTX64.efi", "",
+          f"build pack: phony out/{boot_pkg}.x86_64.xbps", ""]
+
+    L += ["rule clean", "  command = rm -rf out .pkg", "build clean: clean"]
 
     (ROOT / "build.ninja").write_text("\n".join(L) + "\n", encoding="utf-8")
     print("已生成 build.ninja（仅引导）。构建：ninja")

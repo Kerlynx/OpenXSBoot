@@ -746,8 +746,165 @@ static EFI_STATUS read_boot_file(struct EFI_FILE_PROTOCOL *root, CHAR16 *path, v
     return EFI_SUCCESS;
 }
 
-EFI_STATUS mallocAt(EFI_PHYSICAL_ADDRESS addr, UINTN size)
+/* ---- boot.conf：\system\boot.conf 的参数化启动 ------------------------- */
+/*
+ * 格式（每行一条，'#' 起注释）：
+ *   init=/system/leopard/leopard-rc.elf     指定 PID1；空则内核回退默认路径
+ *   flags=0x100                             追加 BOOT_FLAG_* 位（十进制或 0x 十六进制）
+ * 引导器只认这两个键；其余键忽略并写串口日志，不改变启动流程。
+ */
+#define BOOT_CONF_PATH      L"\\system\\boot.conf"
+#define BOOT_LIVE_ROOT_PATH L"\\system\\live-root.img"
+#define BOOT_CONF_MAX       4096
+
+static char   BootConfInit[BOOT_CONFIG_INIT_MAX];
+static UINT64 BootConfFlags = 0;
+
+static int boot_conf_is_space(char c)
 {
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+static char *boot_conf_skip_space(char *p)
+{
+    while (*p != '\0' && boot_conf_is_space(*p)) p++;
+    return p;
+}
+
+static int boot_conf_key_is(char *key, char *want)
+{
+    while (*key != '\0' && *want != '\0')
+    {
+        if (*key != *want) return 0;
+        key++;
+        want++;
+    }
+    return *key == '\0' && *want == '\0';
+}
+
+static UINT64 boot_conf_parse_uint(char *p)
+{
+    UINT64 value = 0;
+    UINT64 base  = 10;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+    {
+        base = 16;
+        p += 2;
+    }
+    while (*p != '\0')
+    {
+        UINT64 digit;
+        if (*p >= '0' && *p <= '9') digit = (UINT64)(*p - '0');
+        else if (base == 16 && *p >= 'a' && *p <= 'f') digit = (UINT64)(*p - 'a' + 10);
+        else if (base == 16 && *p >= 'A' && *p <= 'F') digit = (UINT64)(*p - 'A' + 10);
+        else break;
+        value = value * base + digit;
+        p++;
+    }
+    return value;
+}
+
+static void boot_conf_apply(char *line)
+{
+    char *p = boot_conf_skip_space(line);
+    if (*p == '\0' || *p == '#') return;
+
+    char *comment = p;
+    while (*comment != '\0' && *comment != '#') comment++;
+    *comment = '\0';
+
+    char *eq = p;
+    while (*eq != '\0' && *eq != '=') eq++;
+    if (*eq != '=') return; /* 只认 key=value */
+    *eq = '\0';
+
+    UINT64 klen = strlen(p);
+    while (klen > 0 && boot_conf_is_space(p[klen - 1])) p[--klen] = '\0';
+
+    char  *value = boot_conf_skip_space(eq + 1);
+    UINT64 vlen  = strlen(value);
+    while (vlen > 0 && boot_conf_is_space(value[vlen - 1])) value[--vlen] = '\0';
+    if (vlen >= 2 && value[0] == '"' && value[vlen - 1] == '"')
+    {
+        value[vlen - 1] = '\0';
+        value++;
+        vlen -= 2;
+    }
+
+    if (boot_conf_key_is(p, "init"))
+    {
+        if (vlen > 0 && vlen < BOOT_CONFIG_INIT_MAX)
+        {
+            strcpy(BootConfInit, value);
+            write_serial_string("boot.conf: init=");
+            write_serial_string(BootConfInit);
+            write_serial_string("\n");
+        }
+        else
+        {
+            write_serial_string("boot.conf: init ignored (empty or too long)\n");
+        }
+    }
+    else if (boot_conf_key_is(p, "flags"))
+    {
+        BootConfFlags |= boot_conf_parse_uint(value);
+    }
+    else
+    {
+        write_serial_string("boot.conf: unknown key ignored\n");
+    }
+}
+
+static void boot_conf_load(struct EFI_FILE_PROTOCOL *root)
+{
+    void      *buffer = NULL;
+    UINTN      size   = 0;
+    EFI_STATUS status = read_boot_file(root, BOOT_CONF_PATH, &buffer, &size);
+    if (EFI_ERROR(status))
+    {
+        write_serial_string("boot.conf not found, using defaults.\n");
+        return;
+    }
+
+    static char text[BOOT_CONF_MAX];
+    if (size >= BOOT_CONF_MAX) size = BOOT_CONF_MAX - 1;
+    for (UINTN i = 0; i < size; i++) text[i] = ((char *)buffer)[i];
+    text[size] = '\0';
+    free(buffer);
+
+    char *line = text;
+    while (*line != '\0')
+    {
+        char *nl = line;
+        while (*nl != '\0' && *nl != '\n') nl++;
+        if (*nl != '\n')
+        {
+            boot_conf_apply(line);
+            break;
+        }
+        *nl = '\0';
+        boot_conf_apply(line);
+        line = nl + 1;
+    }
+    write_serial_string("boot.conf loaded.\n");
+}
+
+/* live 介质：\system\live-root.img 存在就整包载入，置 BOOT_FLAG_LIVE_ROOT 交内核解包到 tmpfs。 */
+static int boot_load_live_root(struct EFI_FILE_PROTOCOL *root, void **out_buffer, UINTN *out_size)
+{
+    if (EFI_ERROR(boot_file_exists(root, BOOT_LIVE_ROOT_PATH))) return 0;
+
+    EFI_STATUS status = read_boot_file(root, BOOT_LIVE_ROOT_PATH, out_buffer, out_size);
+    if (EFI_ERROR(status))
+    {
+        write_serial_string("Live root image read failed, booting disk root.\n");
+        return 0;
+    }
+    write_serial_string("Live root pak found.\n");
+    return 1;
+}
+
+EFI_STATUS mallocAt(EFI_PHYSICAL_ADDRESS addr, UINTN size){
     EFI_STATUS           status;
     EFI_PHYSICAL_ADDRESS allocated_addr = addr;
     status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, (size + 0xfff) / 0x1000, &allocated_addr);
@@ -1010,6 +1167,11 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
         }
 
         status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
+
+        /* 参数化启动：\system\boot.conf 的 init= / flags=，以及 live 介质的 live-root.img */
+        boot_conf_load(root);
+        if (boot_load_live_root(root, &installer_root_buffer, &installer_root_size))
+            BootMenuFlags |= BOOT_FLAG_LIVE_ROOT;
     }
 
     if (EFI_ERROR(status))
@@ -1076,8 +1238,15 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     xmemset(BootConfig, 0, sizeof(BOOT_CONFIG));
 
     BootConfig->is_qemu = 0;
-    BootConfig->boot_flags = BootMenuFlags;
-    if (installer_mode)
+    BootConfig->boot_flags = BootMenuFlags | BootConfFlags;
+    if (BootConfInit[0] != '\0')
+    {
+        strcpy(BootConfig->init, BootConfInit);
+        write_serial_string("PID1 init from boot.conf: ");
+        write_serial_string(BootConfig->init);
+        write_serial_string("\n");
+    }
+    if (installer_mode || installer_root_buffer != NULL)
     {
         BootConfig->installer_root_pak = (UINT64)installer_root_buffer;
         BootConfig->installer_root_pak_size = (UINT64)installer_root_size;
