@@ -28,9 +28,9 @@
 #define BOOT_FLAG_LAST_KNOWN_GOOD  (1ULL << 5)
 #define BOOT_FLAG_SHOW_PROGRESS    (1ULL << 6)
 #define BOOT_FLAG_INSTALLER        (1ULL << 7)
-#define BOOT_FLAG_LIVE_ROOT        (1ULL << 8)
+#define BOOT_FLAG_LIVE_ROOT        (1ULL << 8) /* live 介质：root 来自 RAM（引导器载入 live-root.img） */
 
-#define BOOT_CONFIG_INIT_MAX 256  /* PID1 init path buffer */
+#define BOOT_CONFIG_INIT_MAX 256 /* PID1 路径缓冲区长度（须与内核 include/efi/boot.h 一致） */
 
 typedef struct
 {
@@ -54,7 +54,7 @@ typedef struct
     UINT64 system_payload_pak;
     UINT64 system_payload_pak_size;
 
-    char init[BOOT_CONFIG_INIT_MAX]; /* PID1 path: from boot.conf */
+    char init[BOOT_CONFIG_INIT_MAX]; /* PID1 路径：引导器从 boot.conf 读入 init= */
 } BOOT_CONFIG;
 
 #endif

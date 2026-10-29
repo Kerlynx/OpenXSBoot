@@ -746,34 +746,165 @@ static EFI_STATUS read_boot_file(struct EFI_FILE_PROTOCOL *root, CHAR16 *path, v
     return EFI_SUCCESS;
 }
 
-/* parse boot.conf (key=value); only init= for now. # = comment line. */
-static void parse_boot_conf(void *buffer, UINTN size, BOOT_CONFIG *cfg)
+/* ---- boot.conf：\system\boot.conf 的参数化启动 ------------------------- */
+/*
+ * 格式（每行一条，'#' 起注释）：
+ *   init=/system/leopard/leopard-rc.elf     指定 PID1；空则内核回退默认路径
+ *   flags=0x100                             追加 BOOT_FLAG_* 位（十进制或 0x 十六进制）
+ * 引导器只认这两个键；其余键忽略并写串口日志，不改变启动流程。
+ */
+#define BOOT_CONF_PATH      L"\\system\\boot.conf"
+#define BOOT_LIVE_ROOT_PATH L"\\system\\live-root.img"
+#define BOOT_CONF_MAX       4096
+
+static char   BootConfInit[BOOT_CONFIG_INIT_MAX];
+static UINT64 BootConfFlags = 0;
+
+static int boot_conf_is_space(char c)
 {
-    if (buffer == NULL || cfg == NULL || size == 0) return;
-    char *text = (char *)buffer;
-    char *end  = text + size;
-    char *p    = text;
-    while (p < end)
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+static char *boot_conf_skip_space(char *p)
+{
+    while (*p != '\0' && boot_conf_is_space(*p)) p++;
+    return p;
+}
+
+static int boot_conf_key_is(char *key, char *want)
+{
+    while (*key != '\0' && *want != '\0')
     {
-        while (p < end && (*p == 0x0A || *p == 0x0D || *p == 0x20 || *p == 0x09)) p++;
-        if (p >= end) break;
-        if (*p == '#') { while (p < end && *p != 0x0A && *p != 0x0D) p++; continue; }
-        char *eol = p;
-        while (eol < end && *eol != 0x0A && *eol != 0x0D) eol++;
-        if (eol - p >= 5 && part_strcmp(p, "init=", 5) == 0)
+        if (*key != *want) return 0;
+        key++;
+        want++;
+    }
+    return *key == '\0' && *want == '\0';
+}
+
+static UINT64 boot_conf_parse_uint(char *p)
+{
+    UINT64 value = 0;
+    UINT64 base  = 10;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+    {
+        base = 16;
+        p += 2;
+    }
+    while (*p != '\0')
+    {
+        UINT64 digit;
+        if (*p >= '0' && *p <= '9') digit = (UINT64)(*p - '0');
+        else if (base == 16 && *p >= 'a' && *p <= 'f') digit = (UINT64)(*p - 'a' + 10);
+        else if (base == 16 && *p >= 'A' && *p <= 'F') digit = (UINT64)(*p - 'A' + 10);
+        else break;
+        value = value * base + digit;
+        p++;
+    }
+    return value;
+}
+
+static void boot_conf_apply(char *line)
+{
+    char *p = boot_conf_skip_space(line);
+    if (*p == '\0' || *p == '#') return;
+
+    char *comment = p;
+    while (*comment != '\0' && *comment != '#') comment++;
+    *comment = '\0';
+
+    char *eq = p;
+    while (*eq != '\0' && *eq != '=') eq++;
+    if (*eq != '=') return; /* 只认 key=value */
+    *eq = '\0';
+
+    UINT64 klen = strlen(p);
+    while (klen > 0 && boot_conf_is_space(p[klen - 1])) p[--klen] = '\0';
+
+    char  *value = boot_conf_skip_space(eq + 1);
+    UINT64 vlen  = strlen(value);
+    while (vlen > 0 && boot_conf_is_space(value[vlen - 1])) value[--vlen] = '\0';
+    if (vlen >= 2 && value[0] == '"' && value[vlen - 1] == '"')
+    {
+        value[vlen - 1] = '\0';
+        value++;
+        vlen -= 2;
+    }
+
+    if (boot_conf_key_is(p, "init"))
+    {
+        if (vlen > 0 && vlen < BOOT_CONFIG_INIT_MAX)
         {
-            UINTN vlen = (UINTN)(eol - (p + 5));
-            if (vlen >= BOOT_CONFIG_INIT_MAX) vlen = BOOT_CONFIG_INIT_MAX - 1;
-            for (UINTN i = 0; i < vlen; i++) cfg->init[i] = p[5 + i];
-            cfg->init[vlen] = 0;
-            break;
+            strcpy(BootConfInit, value);
+            write_serial_string("boot.conf: init=");
+            write_serial_string(BootConfInit);
+            write_serial_string("\n");
         }
-        p = eol + 1;
+        else
+        {
+            write_serial_string("boot.conf: init ignored (empty or too long)\n");
+        }
+    }
+    else if (boot_conf_key_is(p, "flags"))
+    {
+        BootConfFlags |= boot_conf_parse_uint(value);
+    }
+    else
+    {
+        write_serial_string("boot.conf: unknown key ignored\n");
     }
 }
 
-EFI_STATUS mallocAt(EFI_PHYSICAL_ADDRESS addr, UINTN size)
+static void boot_conf_load(struct EFI_FILE_PROTOCOL *root)
 {
+    void      *buffer = NULL;
+    UINTN      size   = 0;
+    EFI_STATUS status = read_boot_file(root, BOOT_CONF_PATH, &buffer, &size);
+    if (EFI_ERROR(status))
+    {
+        write_serial_string("boot.conf not found, using defaults.\n");
+        return;
+    }
+
+    static char text[BOOT_CONF_MAX];
+    if (size >= BOOT_CONF_MAX) size = BOOT_CONF_MAX - 1;
+    for (UINTN i = 0; i < size; i++) text[i] = ((char *)buffer)[i];
+    text[size] = '\0';
+    free(buffer);
+
+    char *line = text;
+    while (*line != '\0')
+    {
+        char *nl = line;
+        while (*nl != '\0' && *nl != '\n') nl++;
+        if (*nl != '\n')
+        {
+            boot_conf_apply(line);
+            break;
+        }
+        *nl = '\0';
+        boot_conf_apply(line);
+        line = nl + 1;
+    }
+    write_serial_string("boot.conf loaded.\n");
+}
+
+/* live 介质：\system\live-root.img 存在就整包载入，置 BOOT_FLAG_LIVE_ROOT 交内核解包到 tmpfs。 */
+static int boot_load_live_root(struct EFI_FILE_PROTOCOL *root, void **out_buffer, UINTN *out_size)
+{
+    if (EFI_ERROR(boot_file_exists(root, BOOT_LIVE_ROOT_PATH))) return 0;
+
+    EFI_STATUS status = read_boot_file(root, BOOT_LIVE_ROOT_PATH, out_buffer, out_size);
+    if (EFI_ERROR(status))
+    {
+        write_serial_string("Live root image read failed, booting disk root.\n");
+        return 0;
+    }
+    write_serial_string("Live root pak found.\n");
+    return 1;
+}
+
+EFI_STATUS mallocAt(EFI_PHYSICAL_ADDRESS addr, UINTN size){
     EFI_STATUS           status;
     EFI_PHYSICAL_ADDRESS allocated_addr = addr;
     status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, (size + 0xfff) / 0x1000, &allocated_addr);
@@ -978,8 +1109,6 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     void                     *installer_root_buffer = NULL;
     void                     *system_payload_buffer = NULL;
     int                       installer_mode = 0;
-    void                     *bootconf_buffer = NULL;
-    UINTN                     bootconf_size = 0;
 
     // 引导内核
     status = SFSP->OpenVolume(SFSP, &root);
@@ -995,31 +1124,55 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     write_serial_string("Root Dir Open Success.\n");
     boot_status("Opening kernel image");
 
-    root->Close(root);
-    root = NULL;
-
-    status = open_system_volume(&root);
-    if (EFI_ERROR(status))
-    {
-        write_serial_string("system not found\n");
-        while (1)
-            ;
-    }
-
-    status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
-
-    /* 可选 live root pak：引导器把整个 live 介质载入 RAM（live 数据不可变） */
-    if (!EFI_ERROR(status) &&
-        !EFI_ERROR(read_boot_file(root, L"\\system\\live-root.img", &installer_root_buffer,
-                                  &installer_root_size)))
+    status = read_boot_file(root, L"\\installer\\installer-kernel.elf", &kernel_buffer, &kernel_size);
+    if (!EFI_ERROR(status))
     {
         installer_mode = 1;
-        BootMenuFlags |= BOOT_FLAG_LIVE_ROOT;
-        write_serial_string("Live root pak found.\n");
-    }
+        BootMenuFlags |= BOOT_FLAG_INSTALLER | BOOT_FLAG_SHOW_PROGRESS | BOOT_FLAG_DISABLE_KMOD |
+                         BOOT_FLAG_SAFE_STORAGE_IO;
+        write_serial_string("Installer kernel found.\n");
+        boot_status("Loading installer payloads");
 
-    /* optional boot.conf: feed BOOT_CONFIG (init) from a config file */
-    read_boot_file(root, L"\\system\\boot.conf", &bootconf_buffer, &bootconf_size);
+        status = read_boot_file(root, L"\\installer\\installer-root.pak", &installer_root_buffer,
+                                &installer_root_size);
+        if (EFI_ERROR(status))
+        {
+            puts(L"XJ380 installer payload is missing. Error code: INSTALLER_ROOT_NOT_FOUND");
+            write_serial_string("Installer root payload read failed. Stop.\n");
+            while (1)
+                ;
+        }
+
+        status = read_boot_file(root, L"\\installer\\system-payload.pak", &system_payload_buffer,
+                                &system_payload_size);
+        if (EFI_ERROR(status))
+        {
+            puts(L"XJ380 installer payload is missing. Error code: SYSTEM_PAYLOAD_NOT_FOUND");
+            write_serial_string("System payload read failed. Stop.\n");
+            while (1)
+                ;
+        }
+    }
+    else
+    {
+        root->Close(root);
+        root = NULL;
+
+        status = open_system_volume(&root);
+        if (EFI_ERROR(status))
+        {
+            write_serial_string("system not found\n");
+            while (1)
+                ;
+        }
+
+        status = read_boot_file(root, L"\\system\\kernel.krl", &kernel_buffer, &kernel_size);
+
+        /* 参数化启动：\system\boot.conf 的 init= / flags=，以及 live 介质的 live-root.img */
+        boot_conf_load(root);
+        if (boot_load_live_root(root, &installer_root_buffer, &installer_root_size))
+            BootMenuFlags |= BOOT_FLAG_LIVE_ROOT;
+    }
 
     if (EFI_ERROR(status))
     {
@@ -1085,13 +1238,20 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, struct EFI_SYSTEM_TABLE *SystemTable
     xmemset(BootConfig, 0, sizeof(BOOT_CONFIG));
 
     BootConfig->is_qemu = 0;
-    BootConfig->boot_flags = BootMenuFlags;
-    parse_boot_conf(bootconf_buffer, bootconf_size, BootConfig);
-    if (bootconf_buffer != NULL) free(bootconf_buffer);
-    if (installer_mode)
+    BootConfig->boot_flags = BootMenuFlags | BootConfFlags;
+    if (BootConfInit[0] != '\0')
+    {
+        strcpy(BootConfig->init, BootConfInit);
+        write_serial_string("PID1 init from boot.conf: ");
+        write_serial_string(BootConfig->init);
+        write_serial_string("\n");
+    }
+    if (installer_mode || installer_root_buffer != NULL)
     {
         BootConfig->installer_root_pak = (UINT64)installer_root_buffer;
         BootConfig->installer_root_pak_size = (UINT64)installer_root_size;
+        BootConfig->system_payload_pak = (UINT64)system_payload_buffer;
+        BootConfig->system_payload_pak_size = (UINT64)system_payload_size;
     }
 
     // 获取RSDP
